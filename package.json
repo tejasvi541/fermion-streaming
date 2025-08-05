@@ -1,0 +1,21 @@
+{
+  "name": "fermion-streaming",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "scripts": {
+      "dev": "concurrently \"npm run dev:server\" \"npm run dev:frontend\"",
+      "dev:server": "cd server && npm run dev",
+      "dev:frontend": "cd frontend && npm run dev",
+      "install:all": "npm install && cd server && npm install && cd ../frontend && npm install"
+    }
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "concurrently": "^9.2.0"
+  }
+}
