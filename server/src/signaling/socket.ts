@@ -1,14 +1,8 @@
 import { Server as SocketIOServer, Socket } from "socket.io";
 import { MediasoupManager } from "../sfu/mediasoup";
 
-// This interface helps track which socket belongs to which room and its role.
 interface PeerInfo {
   id: string;
-  roomId: string;
-  isStreamer: boolean;
-}
-
-interface JoinRoomData {
   roomId: string;
   isStreamer: boolean;
 }
@@ -17,65 +11,48 @@ export function setupSocketHandlers(
   io: SocketIOServer,
   mediasoupManager: MediasoupManager
 ) {
-  // A map to keep track of our connected peers and their info.
   const peers = new Map<string, PeerInfo>();
 
   io.on("connection", (socket) => {
     console.log(`New socket connection: ${socket.id}`);
 
-    // --- Join Room ---
-    socket.on("join-room", async (data: JoinRoomData, callback) => {
-      try {
-        const { roomId, isStreamer } = data;
-        console.log(
-          `${socket.id} joining room ${roomId} as ${
-            isStreamer ? "streamer" : "viewer"
-          }`
-        );
+    socket.on(
+      "join-room",
+      async (data: { roomId: string; isStreamer: boolean }, callback) => {
+        try {
+          const { roomId, isStreamer } = data;
+          const room = await mediasoupManager.createRoom(roomId);
+          mediasoupManager.addPeerToRoom(roomId, socket.id);
 
-        const room = await mediasoupManager.createRoom(roomId);
-        mediasoupManager.addPeerToRoom(roomId, socket.id);
+          peers.set(socket.id, { id: socket.id, roomId, isStreamer });
+          socket.join(roomId);
 
-        peers.set(socket.id, { id: socket.id, roomId, isStreamer });
-        socket.join(roomId);
+          const rtpCapabilities = room.router.rtpCapabilities;
+          socket
+            .to(roomId)
+            .emit("peer-joined", { peerId: socket.id, isStreamer });
 
-        const rtpCapabilities = room.router.rtpCapabilities;
-
-        // Notify other peers that a new peer has joined.
-        socket
-          .to(roomId)
-          .emit("peer-joined", { peerId: socket.id, isStreamer });
-
-        callback({
-          success: true,
-          rtpCapabilities,
-          roomStats: mediasoupManager.getRoomStats(roomId),
-        });
-        console.log(`${socket.id} joined room ${roomId}`);
-      } catch (error) {
-        console.error("Error joining room:", error);
-        callback({
-          success: false,
-          error: error instanceof Error ? error.message : "Unknown error",
-        });
+          callback({ success: true, rtpCapabilities });
+        } catch (error) {
+          console.error("Error joining room:", error);
+          callback({
+            success: false,
+            error: error instanceof Error ? error.message : "Unknown error",
+          });
+        }
       }
-    });
+    );
 
-    // --- Create WebRTC Transport ---
     socket.on(
       "create-transport",
-      async (data: { roomId: string }, callback) => {
+      async (data: { roomId: string; peerId: string }, callback) => {
         try {
-          const { roomId } = data;
-          console.log(`Creating transport for ${socket.id} in room ${roomId}`);
-
-          // The manager no longer needs the peerId at this stage.
+          const { roomId, peerId } = data;
           const transportData = await mediasoupManager.createWebRtcTransport(
-            roomId
+            roomId,
+            peerId
           );
-
           callback({ success: true, ...transportData });
-          console.log(`Transport created: ${transportData.id}`);
         } catch (error) {
           console.error("Error creating transport:", error);
           callback({
@@ -86,7 +63,6 @@ export function setupSocketHandlers(
       }
     );
 
-    // --- Connect Transport ---
     socket.on(
       "connect-transport",
       async (
@@ -94,17 +70,12 @@ export function setupSocketHandlers(
         callback
       ) => {
         try {
-          const { roomId, transportId, dtlsParameters } = data;
-          console.log(`Connecting transport ${transportId} for ${socket.id}`);
-
           await mediasoupManager.connectTransport(
-            roomId,
-            transportId,
-            dtlsParameters
+            data.roomId,
+            data.transportId,
+            data.dtlsParameters
           );
-
           callback({ success: true });
-          console.log(`Transport connected: ${transportId}`);
         } catch (error) {
           console.error("Error connecting transport:", error);
           callback({
@@ -115,7 +86,6 @@ export function setupSocketHandlers(
       }
     );
 
-    // --- Produce Media ---
     socket.on(
       "produce",
       async (
@@ -129,27 +99,29 @@ export function setupSocketHandlers(
       ) => {
         try {
           const { roomId, transportId, kind, rtpParameters } = data;
-          console.log(`Creating producer for ${socket.id} - ${kind}`);
 
-          // Pass the socket.id as the peerId to the manager.
-          // This is the key change to link the producer to the peer.
-          const { id: producerId } = await mediasoupManager.produce(
+          // This handles the race condition where a room might have been cleaned up.
+          let room = mediasoupManager.getRoom(roomId);
+          if (!room) {
+            console.log(
+              `Room ${roomId} not found during produce, creating it now.`
+            );
+            room = await mediasoupManager.createRoom(roomId);
+            mediasoupManager.addPeerToRoom(roomId, socket.id);
+          }
+
+          const producer = await mediasoupManager.produce(
             roomId,
-            socket.id, // peerId
+            socket.id,
             transportId,
             rtpParameters,
             kind
           );
-
-          // Notify other peers that a new stream is available to be consumed.
           socket.to(roomId).emit("new-producer", {
-            producerId,
+            producerId: producer.id,
             peerId: socket.id,
-            kind,
           });
-
-          callback({ success: true, producerId });
-          console.log(`Producer created: ${producerId} (${kind})`);
+          callback({ success: true, producerId: producer.id });
         } catch (error) {
           console.error("Error creating producer:", error);
           callback({
@@ -160,7 +132,6 @@ export function setupSocketHandlers(
       }
     );
 
-    // --- Consume Media ---
     socket.on(
       "consume",
       async (
@@ -173,20 +144,13 @@ export function setupSocketHandlers(
         callback
       ) => {
         try {
-          const { roomId, transportId, producerId, rtpCapabilities } = data;
-          console.log(
-            `Creating consumer for ${socket.id} - producer: ${producerId}`
-          );
-
           const consumerData = await mediasoupManager.consume(
-            roomId,
-            transportId,
-            producerId,
-            rtpCapabilities
+            data.roomId,
+            data.transportId,
+            data.producerId,
+            data.rtpCapabilities
           );
-
           callback({ success: true, ...consumerData });
-          console.log(`Consumer created: ${consumerData.id}`);
         } catch (error) {
           console.error("Error creating consumer:", error);
           callback({
@@ -197,43 +161,28 @@ export function setupSocketHandlers(
       }
     );
 
-    // --- Resume Consumer ---
     socket.on(
       "resume-consumer",
-      async (data: { roomId: string; consumerId: string }, callback) => {
+      async (data: { roomId: string; consumerId: string }) => {
         try {
-          const { roomId, consumerId } = data;
-          console.log(`Resuming consumer ${consumerId} for ${socket.id}`);
-
-          await mediasoupManager.resumeConsumer(roomId, consumerId);
-
-          callback({ success: true });
-          console.log(`Consumer resumed: ${consumerId}`);
+          await mediasoupManager.resumeConsumer(data.roomId, data.consumerId);
         } catch (error) {
           console.error("Error resuming consumer:", error);
-          callback({
-            success: false,
-            error: error instanceof Error ? error.message : "Unknown error",
-          });
         }
       }
     );
 
-    // --- Get HLS Playlist URL ---
+    // NEW: Get HLS URL handler
     socket.on("get-hls-url", (data: { roomId: string }, callback) => {
       try {
-        const { roomId } = data;
-        const room = mediasoupManager.getRoom(roomId);
-
+        const room = mediasoupManager.getRoom(data.roomId);
         if (room && room.hlsTranscoder && room.hlsTranscoder.isActive()) {
-          callback({
-            success: true,
-            hlsUrl: room.hlsTranscoder.getPlaylistUrl(),
-          });
+          const hlsUrl = room.hlsTranscoder.getPlaylistUrl();
+          callback({ success: true, hlsUrl });
         } else {
           callback({
             success: false,
-            error: "HLS stream not available",
+            error: "Stream not available. Waiting for streamers...",
           });
         }
       } catch (error) {
@@ -245,13 +194,26 @@ export function setupSocketHandlers(
       }
     });
 
-    // --- Get Room Stats ---
+    // NEW: Get room statistics handler
     socket.on("get-room-stats", (data: { roomId: string }, callback) => {
       try {
-        const { roomId } = data;
-        const stats = mediasoupManager.getRoomStats(roomId);
-
-        callback({ success: true, stats });
+        const room = mediasoupManager.getRoom(data.roomId);
+        if (room) {
+          const stats = {
+            roomId: data.roomId,
+            peers: room.peers.size,
+            transports: room.transports.size,
+            producers: room.producers.size,
+            consumers: room.consumers.size,
+            hasHLS: room.hlsTranscoder ? room.hlsTranscoder.isActive() : false,
+          };
+          callback({ success: true, stats });
+        } else {
+          callback({
+            success: false,
+            error: "Room not found",
+          });
+        }
       } catch (error) {
         console.error("Error getting room stats:", error);
         callback({
@@ -261,18 +223,13 @@ export function setupSocketHandlers(
       }
     });
 
-    // --- Handle Disconnect ---
     socket.on("disconnect", () => {
       console.log(`Socket disconnected: ${socket.id}`);
-
       const peer = peers.get(socket.id);
       if (peer) {
         mediasoupManager.removePeerFromRoom(peer.roomId, socket.id);
-
         socket.to(peer.roomId).emit("peer-left", { peerId: socket.id });
-
         peers.delete(socket.id);
-        console.log(`Peer ${socket.id} left room ${peer.roomId}`);
       }
     });
 
@@ -280,6 +237,4 @@ export function setupSocketHandlers(
       console.error(`Socket error for ${socket.id}:`, error);
     });
   });
-
-  console.log("Socket.IO handlers initialized");
 }
